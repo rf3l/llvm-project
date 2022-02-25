@@ -567,6 +567,9 @@ namespace {
                                 SDValue &InFlag);
 
     bool tryOptimizeRem8Extend(SDNode *N);
+    bool postprocessTestRR(SDNode *N);
+    bool postprocessKortestRR(SDNode *N);
+    bool postprocessSubregToReg(SDNode *N);
 
     bool onlyUsesZeroFlag(SDValue Flags) const;
     bool hasNoSignFlagUses(SDValue Flags) const;
@@ -1429,9 +1432,9 @@ void X86DAGToDAGISel::PreprocessISelDAG() {
 // Look for a redundant movzx/movsx that can occur after an 8-bit divrem.
 bool X86DAGToDAGISel::tryOptimizeRem8Extend(SDNode *N) {
   unsigned Opc = N->getMachineOpcode();
-  if (Opc != X86::MOVZX32rr8 && Opc != X86::MOVSX32rr8 &&
-      Opc != X86::MOVSX64rr8)
-    return false;
+  assert((Opc == X86::MOVZX32rr8 || Opc == X86::MOVSX32rr8 ||
+          Opc == X86::MOVSX64rr8) &&
+         "expected MOVSX opcode");
 
   SDValue N0 = N->getOperand(0);
 
@@ -1462,6 +1465,174 @@ bool X86DAGToDAGISel::tryOptimizeRem8Extend(SDNode *N) {
   return true;
 }
 
+// Look for a TESTrr+ANDrr pattern where both operands of the test are
+// the same. Rewrite to remove the AND.
+bool X86DAGToDAGISel::postprocessTestRR(SDNode *N) {
+  unsigned Opc = N->getMachineOpcode();
+  assert((Opc == X86::TEST8rr || Opc == X86::TEST16rr || Opc == X86::TEST32rr ||
+          Opc == X86::TEST64rr) &&
+         "expected TEST opcode");
+  SDValue Op0 = N->getOperand(0);
+  if (N->getOperand(1) != Op0 || !N->isOnlyUserOf(Op0.getNode()) ||
+      !Op0.isMachineOpcode()) {
+    return false;
+  }
+  SDValue And = Op0;
+  unsigned NewOpc;
+  switch (And.getMachineOpcode()) {
+  case X86::AND8rr:
+  case X86::AND16rr:
+  case X86::AND32rr:
+  case X86::AND64rr: {
+    MachineSDNode *Test = CurDAG->getMachineNode(
+        Opc, SDLoc(N), MVT::i32, And.getOperand(0), And.getOperand(1));
+    ReplaceUses(N, Test);
+    return true;
+  }
+  case X86::AND8rm:
+    NewOpc = X86::TEST8mr;
+    break;
+  case X86::AND16rm:
+    NewOpc = X86::TEST16mr;
+    break;
+  case X86::AND32rm:
+    NewOpc = X86::TEST32mr;
+    break;
+  case X86::AND64rm:
+    NewOpc = X86::TEST64mr;
+    break;
+  default:
+    return false;
+  }
+  // Need to swap the memory and register operand.
+  SDValue Ops[] = {
+      And.getOperand(1), And.getOperand(2), And.getOperand(3),
+      And.getOperand(4), And.getOperand(5), And.getOperand(0),
+      And.getOperand(6) /* Chain */
+  };
+  MachineSDNode *Test =
+      CurDAG->getMachineNode(NewOpc, SDLoc(N), MVT::i32, MVT::Other, Ops);
+  CurDAG->setNodeMemRefs(Test,
+                         cast<MachineSDNode>(And.getNode())->memoperands());
+  ReplaceUses(N, Test);
+  return true;
+}
+
+// Look for a KAND+KORTEST and turn it into KTEST if only the zero flag is
+// used. We're doing this late so we can prefer to fold the AND into masked
+// comparisons. Doing that can be better for the live range of the mask
+// register.
+bool X86DAGToDAGISel::postprocessKortestRR(SDNode *N) {
+  unsigned Opc = N->getMachineOpcode();
+  assert((Opc == X86::KORTESTBrr || Opc == X86::KORTESTWrr ||
+          Opc == X86::KORTESTDrr || Opc == X86::KORTESTQrr) &&
+         "expected KORTEST opcode");
+  SDValue Op0 = N->getOperand(0);
+  if (N->getOperand(1) != Op0 || !N->isOnlyUserOf(Op0.getNode()) ||
+      !Op0.isMachineOpcode() || !onlyUsesZeroFlag(SDValue(N, 0))) {
+    return false;
+  }
+  SDValue And = Op0;
+  unsigned AndOpc = And.getMachineOpcode();
+  // KANDW is legal with AVX512F, but KTESTW requires AVX512DQ. The other
+  // KAND instructions and KTEST use the same ISA feature.
+  if (AndOpc != X86::KANDBrr &&
+      (AndOpc != X86::KANDWrr || !Subtarget->hasDQI()) &&
+      AndOpc != X86::KANDDrr && AndOpc != X86::KANDQrr) {
+    return false;
+  }
+  unsigned NewOpc;
+  switch (Opc) {
+  default:
+    llvm_unreachable("Unexpected opcode!");
+  case X86::KORTESTBrr:
+    NewOpc = X86::KTESTBrr;
+    break;
+  case X86::KORTESTWrr:
+    NewOpc = X86::KTESTWrr;
+    break;
+  case X86::KORTESTDrr:
+    NewOpc = X86::KTESTDrr;
+    break;
+  case X86::KORTESTQrr:
+    NewOpc = X86::KTESTQrr;
+    break;
+  }
+  MachineSDNode *KTest = CurDAG->getMachineNode(
+      NewOpc, SDLoc(N), MVT::i32, And.getOperand(0), And.getOperand(1));
+  ReplaceUses(N, KTest);
+  return true;
+}
+
+// Attempt to remove vectors moves that were inserted to zero upper bits.
+bool X86DAGToDAGISel::postprocessSubregToReg(SDNode *N) {
+  assert(N->getMachineOpcode() == TargetOpcode::SUBREG_TO_REG &&
+         "must be called with SUBREG_TO_REG");
+
+  unsigned SubRegIdx = N->getConstantOperandVal(2);
+  if (SubRegIdx != X86::sub_xmm && SubRegIdx != X86::sub_ymm)
+    return false;
+
+  SDValue Move = N->getOperand(1);
+  if (!Move.isMachineOpcode())
+    return false;
+
+  // Make sure its one of the move opcodes we recognize.
+  switch (Move.getMachineOpcode()) {
+  default:
+    return false;
+  case X86::VMOVAPDrr:
+  case X86::VMOVUPDrr:
+  case X86::VMOVAPSrr:
+  case X86::VMOVUPSrr:
+  case X86::VMOVDQArr:
+  case X86::VMOVDQUrr:
+  case X86::VMOVAPDYrr:
+  case X86::VMOVUPDYrr:
+  case X86::VMOVAPSYrr:
+  case X86::VMOVUPSYrr:
+  case X86::VMOVDQAYrr:
+  case X86::VMOVDQUYrr:
+  case X86::VMOVAPDZ128rr:
+  case X86::VMOVUPDZ128rr:
+  case X86::VMOVAPSZ128rr:
+  case X86::VMOVUPSZ128rr:
+  case X86::VMOVDQA32Z128rr:
+  case X86::VMOVDQU32Z128rr:
+  case X86::VMOVDQA64Z128rr:
+  case X86::VMOVDQU64Z128rr:
+  case X86::VMOVAPDZ256rr:
+  case X86::VMOVUPDZ256rr:
+  case X86::VMOVAPSZ256rr:
+  case X86::VMOVUPSZ256rr:
+  case X86::VMOVDQA32Z256rr:
+  case X86::VMOVDQU32Z256rr:
+  case X86::VMOVDQA64Z256rr:
+  case X86::VMOVDQU64Z256rr:
+    break;
+  }
+
+  SDValue In = Move.getOperand(0);
+  if (!In.isMachineOpcode() ||
+      In.getMachineOpcode() <= TargetOpcode::GENERIC_OP_END) {
+    return false;
+  }
+
+  // Make sure the instruction has a VEX, XOP, or EVEX prefix. This covers
+  // the SHA instructions which use a legacy encoding.
+  uint64_t TSFlags = getInstrInfo()->get(In.getMachineOpcode()).TSFlags;
+  if ((TSFlags & X86II::EncodingMask) != X86II::VEX &&
+      (TSFlags & X86II::EncodingMask) != X86II::EVEX &&
+      (TSFlags & X86II::EncodingMask) != X86II::XOP) {
+    return false;
+  }
+
+  // Producing instruction is another vector instruction. We can drop the
+  // move.
+  CurDAG->UpdateNodeOperands(N, N->getOperand(0), In, N->getOperand(2));
+  return true;
+}
+
 void X86DAGToDAGISel::PostprocessISelDAG() {
   // Skip peepholes at -O0.
   if (TM.getOptLevel() == CodeGenOpt::None)
@@ -1476,144 +1647,40 @@ void X86DAGToDAGISel::PostprocessISelDAG() {
     if (N->use_empty() || !N->isMachineOpcode())
       continue;
 
-    if (tryOptimizeRem8Extend(N)) {
-      MadeChange = true;
-      continue;
-    }
-
-    // Look for a TESTrr+ANDrr pattern where both operands of the test are
-    // the same. Rewrite to remove the AND.
-    unsigned Opc = N->getMachineOpcode();
-    if ((Opc == X86::TEST8rr || Opc == X86::TEST16rr ||
-         Opc == X86::TEST32rr || Opc == X86::TEST64rr) &&
-        N->getOperand(0) == N->getOperand(1) &&
-        N->isOnlyUserOf(N->getOperand(0).getNode()) &&
-        N->getOperand(0).isMachineOpcode()) {
-      SDValue And = N->getOperand(0);
-      unsigned N0Opc = And.getMachineOpcode();
-      if (N0Opc == X86::AND8rr || N0Opc == X86::AND16rr ||
-          N0Opc == X86::AND32rr || N0Opc == X86::AND64rr) {
-        MachineSDNode *Test = CurDAG->getMachineNode(Opc, SDLoc(N),
-                                                     MVT::i32,
-                                                     And.getOperand(0),
-                                                     And.getOperand(1));
-        ReplaceUses(N, Test);
+    switch (N->getMachineOpcode()) {
+    case TargetOpcode::SUBREG_TO_REG:
+      if (postprocessSubregToReg(N)) {
         MadeChange = true;
         continue;
       }
-      if (N0Opc == X86::AND8rm || N0Opc == X86::AND16rm ||
-          N0Opc == X86::AND32rm || N0Opc == X86::AND64rm) {
-        unsigned NewOpc;
-        switch (N0Opc) {
-        case X86::AND8rm:  NewOpc = X86::TEST8mr; break;
-        case X86::AND16rm: NewOpc = X86::TEST16mr; break;
-        case X86::AND32rm: NewOpc = X86::TEST32mr; break;
-        case X86::AND64rm: NewOpc = X86::TEST64mr; break;
-        }
-
-        // Need to swap the memory and register operand.
-        SDValue Ops[] = { And.getOperand(1),
-                          And.getOperand(2),
-                          And.getOperand(3),
-                          And.getOperand(4),
-                          And.getOperand(5),
-                          And.getOperand(0),
-                          And.getOperand(6)  /* Chain */ };
-        MachineSDNode *Test = CurDAG->getMachineNode(NewOpc, SDLoc(N),
-                                                     MVT::i32, MVT::Other, Ops);
-        CurDAG->setNodeMemRefs(
-            Test, cast<MachineSDNode>(And.getNode())->memoperands());
-        ReplaceUses(N, Test);
+      break;
+    case X86::KORTESTBrr:
+    case X86::KORTESTWrr:
+    case X86::KORTESTDrr:
+    case X86::KORTESTQrr:
+      if (postprocessKortestRR(N)) {
         MadeChange = true;
         continue;
       }
-    }
-
-    // Look for a KAND+KORTEST and turn it into KTEST if only the zero flag is
-    // used. We're doing this late so we can prefer to fold the AND into masked
-    // comparisons. Doing that can be better for the live range of the mask
-    // register.
-    if ((Opc == X86::KORTESTBrr || Opc == X86::KORTESTWrr ||
-         Opc == X86::KORTESTDrr || Opc == X86::KORTESTQrr) &&
-        N->getOperand(0) == N->getOperand(1) &&
-        N->isOnlyUserOf(N->getOperand(0).getNode()) &&
-        N->getOperand(0).isMachineOpcode() &&
-        onlyUsesZeroFlag(SDValue(N, 0))) {
-      SDValue And = N->getOperand(0);
-      unsigned N0Opc = And.getMachineOpcode();
-      // KANDW is legal with AVX512F, but KTESTW requires AVX512DQ. The other
-      // KAND instructions and KTEST use the same ISA feature.
-      if (N0Opc == X86::KANDBrr ||
-          (N0Opc == X86::KANDWrr && Subtarget->hasDQI()) ||
-          N0Opc == X86::KANDDrr || N0Opc == X86::KANDQrr) {
-        unsigned NewOpc;
-        switch (Opc) {
-        default: llvm_unreachable("Unexpected opcode!");
-        case X86::KORTESTBrr: NewOpc = X86::KTESTBrr; break;
-        case X86::KORTESTWrr: NewOpc = X86::KTESTWrr; break;
-        case X86::KORTESTDrr: NewOpc = X86::KTESTDrr; break;
-        case X86::KORTESTQrr: NewOpc = X86::KTESTQrr; break;
-        }
-        MachineSDNode *KTest = CurDAG->getMachineNode(NewOpc, SDLoc(N),
-                                                      MVT::i32,
-                                                      And.getOperand(0),
-                                                      And.getOperand(1));
-        ReplaceUses(N, KTest);
+      break;
+    case X86::MOVZX32rr8:
+    case X86::MOVSX32rr8:
+    case X86::MOVSX64rr8:
+      if (tryOptimizeRem8Extend(N)) {
         MadeChange = true;
         continue;
       }
-    }
-
-    // Attempt to remove vectors moves that were inserted to zero upper bits.
-    if (Opc != TargetOpcode::SUBREG_TO_REG)
-      continue;
-
-    unsigned SubRegIdx = N->getConstantOperandVal(2);
-    if (SubRegIdx != X86::sub_xmm && SubRegIdx != X86::sub_ymm)
-      continue;
-
-    SDValue Move = N->getOperand(1);
-    if (!Move.isMachineOpcode())
-      continue;
-
-    // Make sure its one of the move opcodes we recognize.
-    switch (Move.getMachineOpcode()) {
-    default:
-      continue;
-    case X86::VMOVAPDrr:       case X86::VMOVUPDrr:
-    case X86::VMOVAPSrr:       case X86::VMOVUPSrr:
-    case X86::VMOVDQArr:       case X86::VMOVDQUrr:
-    case X86::VMOVAPDYrr:      case X86::VMOVUPDYrr:
-    case X86::VMOVAPSYrr:      case X86::VMOVUPSYrr:
-    case X86::VMOVDQAYrr:      case X86::VMOVDQUYrr:
-    case X86::VMOVAPDZ128rr:   case X86::VMOVUPDZ128rr:
-    case X86::VMOVAPSZ128rr:   case X86::VMOVUPSZ128rr:
-    case X86::VMOVDQA32Z128rr: case X86::VMOVDQU32Z128rr:
-    case X86::VMOVDQA64Z128rr: case X86::VMOVDQU64Z128rr:
-    case X86::VMOVAPDZ256rr:   case X86::VMOVUPDZ256rr:
-    case X86::VMOVAPSZ256rr:   case X86::VMOVUPSZ256rr:
-    case X86::VMOVDQA32Z256rr: case X86::VMOVDQU32Z256rr:
-    case X86::VMOVDQA64Z256rr: case X86::VMOVDQU64Z256rr:
+      break;
+    case X86::TEST8rr:
+    case X86::TEST16rr:
+    case X86::TEST32rr:
+    case X86::TEST64rr:
+      if (postprocessTestRR(N)) {
+        MadeChange = true;
+        continue;
+      }
       break;
     }
-
-    SDValue In = Move.getOperand(0);
-    if (!In.isMachineOpcode() ||
-        In.getMachineOpcode() <= TargetOpcode::GENERIC_OP_END)
-      continue;
-
-    // Make sure the instruction has a VEX, XOP, or EVEX prefix. This covers
-    // the SHA instructions which use a legacy encoding.
-    uint64_t TSFlags = getInstrInfo()->get(In.getMachineOpcode()).TSFlags;
-    if ((TSFlags & X86II::EncodingMask) != X86II::VEX &&
-        (TSFlags & X86II::EncodingMask) != X86II::EVEX &&
-        (TSFlags & X86II::EncodingMask) != X86II::XOP)
-      continue;
-
-    // Producing instruction is another vector instruction. We can drop the
-    // move.
-    CurDAG->UpdateNodeOperands(N, N->getOperand(0), In, N->getOperand(2));
-    MadeChange = true;
   }
 
   if (MadeChange)
