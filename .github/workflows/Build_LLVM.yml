@@ -1,34 +1,35 @@
 name: Builds
 on: [push, pull_request]
 jobs:
-  runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        compiler: 'clang'
+  Linux :
+    runs-on: ubuntu-latest
+      strategy:
+        fail-fast: false
+        matrix:
+          compiler: 'clang'
 
-    name: Ubuntu latest / ${{ matrix.compiler }}
-    steps:
-    - name: Installing dependencies
-      run: |
-        sudo apt-get -y update
-        sudo apt install -y cmake ninja-build clang
-    - name: Build with clang
-      if: matrix.compiler == 'clang'
-      env:
-        CC: clang-14
-        CXX: clang++-14
-      run: |
-        mkdir build
-        cd build
-        cmake -G "Ninja" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLLVM_ENABLE_PROJECTS="clang" -DLLVM_TARGETS_TO_BUILD="X86" -DLLVM_USE_LINKER=gold -DLLVM_PARALLEL_LINK_JOBS=2 ../llvm-project/llvm
-        ninja -j$(nproc) all
-    - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v1
+      name: Ubuntu latest / ${{ matrix.compiler }}
+      steps:
+      - name: Installing dependencies
+        run: |
+          sudo apt-get -y update
+          sudo apt install -y cmake ninja-build clang
+      - name: Build with clang
+        if: matrix.compiler == 'clang'
+        env:
+          CC: clang-14
+          CXX: clang++-14
+        run: |
+          mkdir build
+          cd build
+          cmake -G "Ninja" -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLLVM_ENABLE_PROJECTS="clang" -DLLVM_TARGETS_TO_BUILD="X86" -DLLVM_USE_LINKER=gold -DLLVM_PARALLEL_LINK_JOBS=2 ../llvm-project/llvm
+          ninja -j$(nproc) all
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v1
 
-    - name: Upload artifacts
-      uses: actions/upload-artifact@v2
-      with:
-        name: llvm_build         
-        path: |
-          build/llvm
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: llvm_build         
+          path: |
+            build/llvm
